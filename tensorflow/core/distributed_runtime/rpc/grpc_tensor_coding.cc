@@ -34,7 +34,8 @@ void EncodeRecvTensorResponseToByteBuffer(const RecvTensorResponse& proto,
   ::grpc::Slice slice(proto.ByteSizeLong());
   proto.SerializeWithCachedSizesToArray(
       const_cast<uint8*>(reinterpret_cast<const uint8*>(slice.begin())));
-  *result = ::grpc::ByteBuffer(&slice, 1);
+  ::grpc::ByteBuffer tmp(&slice, 1);
+  result->Swap(&tmp);
 }
 
 // We generate a RecvTensorResponse protocol buffer encoding into "*result",
@@ -213,22 +214,13 @@ void EncodeTensorToByteBuffer(bool is_dead, const Tensor& val,
 
     if (tensor_data_is_large) {
       // (E) Encode tensor data, but by sharing backing store
-
-      // TODO(vpai): Use the pure C++ ::grpc::Slice constructor that uses
-      // grpc_slice_new_with_user_data once TensorFlow pins a version of gRPC
-      // that includes https://github.com/grpc/grpc/pull/12065
-
       const TensorBuffer* buf = DMAHelper::buffer(&val);
       buf->Ref();
       slices[1] = ::grpc::Slice(
-          grpc_slice_new_with_user_data(
-              const_cast<void*>(static_cast<const void*>(tdata.data())),
-              tdata.size(),
-              [](void* backing) {
-                static_cast<TensorBuffer*>(backing)->Unref();
-              },
-              const_cast<TensorBuffer*>(buf)),
-          ::grpc::Slice::STEAL_REF);
+          const_cast<void*>(static_cast<const void*>(tdata.data())),
+          tdata.size(),
+          [](void* backing) { static_cast<TensorBuffer*>(backing)->Unref(); },
+          const_cast<TensorBuffer*>(buf));
       num_slices += 1;
     }
     size_t total_bytes = 0;
@@ -237,7 +229,8 @@ void EncodeTensorToByteBuffer(bool is_dead, const Tensor& val,
     }
     CHECK_EQ(total_bytes, expected_size);
 
-    *result = ::grpc::ByteBuffer(&slices[0], num_slices);
+    ::grpc::ByteBuffer tmp(&slices[0], num_slices);
+    result->Swap(&tmp);
   }
 }
 

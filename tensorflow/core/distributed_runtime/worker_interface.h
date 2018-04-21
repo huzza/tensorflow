@@ -44,6 +44,10 @@ class WorkerInterface {
       const CreateWorkerSessionRequest* request,
       CreateWorkerSessionResponse* response, StatusCallback done) = 0;
 
+  virtual void DeleteWorkerSessionAsync(
+      CallOptions* opts, const DeleteWorkerSessionRequest* request,
+      DeleteWorkerSessionResponse* response, StatusCallback done) = 0;
+
   virtual void RegisterGraphAsync(const RegisterGraphRequest* request,
                                   RegisterGraphResponse* response,
                                   StatusCallback done) = 0;
@@ -118,6 +122,12 @@ class WorkerInterface {
     return CallAndWait(&ME::CreateWorkerSessionAsync, request, response);
   }
 
+  Status DeleteWorkerSession(const DeleteWorkerSessionRequest* request,
+                             DeleteWorkerSessionResponse* response) {
+    return CallAndWaitWithOptions(&ME::DeleteWorkerSessionAsync, request,
+                                  response);
+  }
+
   Status RegisterGraph(const RegisterGraphRequest* request,
                        RegisterGraphResponse* response) {
     return CallAndWait(&ME::RegisterGraphAsync, request, response);
@@ -168,6 +178,19 @@ class WorkerInterface {
     Status ret;
     Notification n;
     (this->*func)(req, resp, [&ret, &n](const Status& s) {
+      ret = s;
+      n.Notify();
+    });
+    n.WaitForNotification();
+    return ret;
+  }
+
+  template <typename Method, typename Req, typename Resp>
+  Status CallAndWaitWithOptions(Method func, const Req* req, Resp* resp) {
+    CallOptions call_opts;
+    Status ret;
+    Notification n;
+    (this->*func)(&call_opts, req, resp, [&ret, &n](const Status& s) {
       ret = s;
       n.Notify();
     });

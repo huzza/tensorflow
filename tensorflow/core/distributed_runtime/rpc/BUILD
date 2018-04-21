@@ -6,18 +6,6 @@ licenses(["notice"])  # Apache 2.0
 exports_files(["LICENSE"])
 
 filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
-    visibility = ["//tensorflow:__subpackages__"],
-)
-
-filegroup(
     name = "c_srcs",
     data = glob([
         "**/*.cc",
@@ -32,6 +20,7 @@ load(
 )
 load("//tensorflow:tensorflow.bzl", "tf_cuda_cc_test")
 load("//tensorflow:tensorflow.bzl", "tf_cuda_cc_tests")
+load("//tensorflow:tensorflow.bzl", "tf_cc_binary")
 
 # For platform specific build config
 load(
@@ -52,9 +41,11 @@ cc_library(
     srcs = ["grpc_util.cc"],
     hdrs = ["grpc_util.h"],
     deps = [
-        "//tensorflow/core:lib",
-        "@grpc//:grpc++_unsecure",
         "@grpc//:grpc_unsecure",
+        "@grpc//:grpc++_unsecure",
+        "//tensorflow/core:lib",
+        # Required to be able to overload TensorResponse parsing.
+        "//tensorflow/core/distributed_runtime:tensor_coding",
     ],
 )
 
@@ -70,17 +61,33 @@ cc_library(
 )
 
 cc_library(
+    name = "grpc_state",
+    srcs = [],
+    hdrs = ["grpc_state.h"],
+    deps = [
+        ":grpc_client_cq_tag",
+        ":grpc_util",
+        "//tensorflow/core:lib",
+        "//tensorflow/core/distributed_runtime:call_options",
+        "//tensorflow/core/distributed_runtime:tensor_coding",
+        "@grpc//:grpc++_unsecure",
+    ],
+)
+
+cc_library(
     name = "grpc_remote_worker",
     srcs = ["grpc_remote_worker.cc"],
     hdrs = ["grpc_remote_worker.h"],
     deps = [
         ":grpc_client_cq_tag",
+        ":grpc_state",
         ":grpc_util",
         ":grpc_worker_service_impl",
         "//tensorflow/core:core_cpu_internal",
         "//tensorflow/core:lib",
         "//tensorflow/core:lib_internal",
         "//tensorflow/core:worker_proto_cc",
+        "//tensorflow/core/distributed_runtime:tensor_coding",
         "//tensorflow/core/distributed_runtime:worker_cache_logger",
         "//tensorflow/core/distributed_runtime:worker_interface",
         "@grpc//:grpc++_unsecure",
@@ -167,6 +174,7 @@ tf_cuda_library(
         "//tensorflow/core:lib_internal",
         "//tensorflow/core:worker_proto_cc",
         "//tensorflow/core/distributed_runtime:graph_mgr",
+        "//tensorflow/core/distributed_runtime:recent_request_ids",
         "//tensorflow/core/distributed_runtime:rendezvous_mgr_interface",
         "//tensorflow/core/distributed_runtime:worker",
         "//tensorflow/core/distributed_runtime:worker_cache",
@@ -181,9 +189,9 @@ cc_library(
     srcs = ["grpc_worker_service_impl.cc"],
     hdrs = ["grpc_worker_service_impl.h"],
     deps = [
-        ":grpc_serialization_traits",
+        ":grpc_util",
         "//tensorflow/core:worker_proto_cc",
-        "//tensorflow/core/distributed_runtime:worker_interface",
+        "//tensorflow/core/distributed_runtime:tensor_coding",
         "@grpc//:grpc++_unsecure",
     ],
 )
@@ -227,17 +235,7 @@ cc_library(
     srcs = ["grpc_master_service_impl.cc"],
     hdrs = ["grpc_master_service_impl.h"],
     deps = [
-        ":grpc_serialization_traits",
         "//tensorflow/core:master_proto_cc",
-        "@grpc//:grpc++_unsecure",
-    ],
-)
-
-cc_library(
-    name = "grpc_serialization_traits",
-    srcs = [],
-    hdrs = ["grpc_serialization_traits.h"],
-    deps = [
         "@grpc//:grpc++_unsecure",
     ],
 )
@@ -251,6 +249,8 @@ cc_library(
         "//tensorflow/core:framework",
         "//tensorflow/core:lib",
         "//tensorflow/core/distributed_runtime:base_rendezvous_mgr",
+        "//tensorflow/core/distributed_runtime:request_id",
+        "//tensorflow/core/distributed_runtime:tensor_coding",
         "//tensorflow/core/distributed_runtime:worker_cache",
         "//tensorflow/core/distributed_runtime:worker_env",
         "//tensorflow/core/distributed_runtime:worker_interface",
@@ -297,7 +297,7 @@ cc_library(
     ],
 )
 
-cc_binary(
+tf_cc_binary(
     name = "grpc_tensorflow_server",
     srcs = [
         "grpc_tensorflow_server.cc",
@@ -326,7 +326,7 @@ tf_cuda_library(
     alwayslink = 1,
 )
 
-cc_binary(
+tf_cc_binary(
     name = "grpc_testlib_server",
     testonly = 1,
     srcs = [
@@ -359,6 +359,7 @@ tf_cuda_library(
     data = [
         ":grpc_testlib_server",
     ],
+    visibility = ["//tensorflow:__subpackages__"],
     deps = [
         ":grpc_session",
         ":grpc_testlib_ops",
@@ -463,7 +464,9 @@ tf_cuda_cc_test(
     size = "medium",
     srcs = ["grpc_session_test.cc"],
     linkstatic = tf_kernel_tests_linkstatic(),
-    tags = tf_cuda_tests_tags() + ["no_oss"],  # b/62956105: port conflicts.
+    tags = tf_cuda_tests_tags() + [
+        "no_oss",  # b/62956105: port conflicts.
+    ],
     deps = [
         ":grpc_channel",
         ":grpc_server_lib",
@@ -484,4 +487,34 @@ tf_cuda_cc_test(
         "//tensorflow/core/kernels:matmul_op",
         "//tensorflow/core/kernels:variable_ops",
     ],
+)
+
+cc_library(
+    name = "grpc_rpc_factory",
+    srcs = [
+        "grpc_rpc_factory.cc",
+    ],
+    hdrs = ["grpc_rpc_factory.h"],
+    deps = [
+        ":grpc_state",
+        ":grpc_util",
+        "//tensorflow/core:framework",
+        "//tensorflow/core:lib",
+        "//tensorflow/core:lib_internal",
+        "//tensorflow/core/util/rpc:call_container",
+        "//tensorflow/core/util/rpc:rpc_factory",
+    ],
+)
+
+cc_library(
+    name = "grpc_rpc_factory_registration",
+    srcs = [
+        "grpc_rpc_factory_registration.cc",
+    ],
+    deps = [
+        ":grpc_rpc_factory",
+        "//tensorflow/core/util/rpc:rpc_factory",
+        "//tensorflow/core/util/rpc:rpc_factory_registry",
+    ],
+    alwayslink = 1,
 )

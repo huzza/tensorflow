@@ -13,34 +13,49 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "tensorflow/core/framework/common_shape_fns.h"
 #include "tensorflow/core/framework/op.h"
 
 namespace tensorflow {
 
-REGISTER_OP("_XLASend")
+REGISTER_OP("XlaSend")
     .Input("tensor: T")
     .Attr("T: type")
     .Attr("tensor_name: string")
     .SetIsStateful()
+    .SetShapeFn(shape_inference::UnknownShape)
     .Doc(R"doc(
-Sends the named tensor to another XLA computation.
+Sends the named tensor to another XLA computation. Wraps the XLA Send operator
+documented at
+ https://www.tensorflow.org/performance/xla/operation_semantics#send .
 
 tensor: The tensor to send.
-tensor_name: The name of the tensor to send.
+tensor_name: A string key that identifies the channel.
 )doc");
 
-REGISTER_OP("_XLARecv")
-    .Output("tensor: T")
-    .Attr("T: type")
+REGISTER_OP("XlaRecv")
+    .Output("tensor: dtype")
+    .Attr("dtype: type")
     .Attr("tensor_name: string")
     .Attr("shape: shape")
     .SetIsStateful()
+    .SetShapeFn([](shape_inference::InferenceContext* c) {
+      TensorShape shape_attr;
+      TF_RETURN_IF_ERROR(c->GetAttr("shape", &shape_attr));
+      shape_inference::ShapeHandle s;
+      TF_RETURN_IF_ERROR(c->MakeShapeFromTensorShape(shape_attr, &s));
+      c->set_output(0, s);
+      return Status::OK();
+    })
     .Doc(R"doc(
-Receives the named tensor from another XLA computation.
+Receives the named tensor from another XLA computation. Wraps the XLA Recv
+operator documented at
+ https://www.tensorflow.org/performance/xla/operation_semantics#recv .
 
 tensor: The tensor to receive.
-tensor_name: The name of the tensor to receive.
-shape: The shape of the input tensor.
+dtype: The type of the tensor.
+tensor_name: A string key that identifies the channel.
+shape: The shape of the tensor.
 )doc");
 
 }  // namespace tensorflow

@@ -42,12 +42,13 @@ py_library(
         "//tensorflow/python:state_ops",
         "//tensorflow/python:util",
         "//tensorflow/python:variable_scope",
+        "//tensorflow/python:weights_broadcast_ops",
+        "//tensorflow/python/ops/distributions",
     ],
 )
 
 py_test(
     name = "classification_test",
-    size = "small",
     srcs = ["python/metrics/classification_test.py"],
     srcs_version = "PY2AND3",
     deps = [
@@ -95,15 +96,4 @@ py_test(
         "//tensorflow/python:variables",
         "//third_party/py/numpy",
     ],
-)
-
-filegroup(
-    name = "all_files",
-    srcs = glob(
-        ["**/*"],
-        exclude = [
-            "**/METADATA",
-            "**/OWNERS",
-        ],
-    ),
 )

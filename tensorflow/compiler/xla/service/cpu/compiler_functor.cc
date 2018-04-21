@@ -25,11 +25,11 @@ limitations under the License.
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
-#include "llvm/ExecutionEngine/ObjectMemoryBuffer.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/Object/ObjectFile.h"
+#include "llvm/Support/SmallVectorMemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/IPO.h"
@@ -37,8 +37,6 @@ limitations under the License.
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "tensorflow/compiler/xla/ptr_util.h"
 #include "tensorflow/compiler/xla/service/cpu/cpu_runtime.h"
-#include "tensorflow/compiler/xla/service/cpu/cpu_runtime_avx.h"
-#include "tensorflow/compiler/xla/service/cpu/cpu_runtime_sse4_1.h"
 #include "tensorflow/compiler/xla/service/cpu/llvm_ir_runtime.h"
 #include "tensorflow/compiler/xla/service/llvm_ir/llvm_util.h"
 #include "tensorflow/compiler/xla/statusor.h"
@@ -49,18 +47,57 @@ limitations under the License.
 namespace xla {
 namespace cpu {
 
-/* static */ CompilerFunctor::VectorIntrinsics
-CompilerFunctor::AllIntrinsics() {
-  VectorIntrinsics intrinsics;
-  intrinsics.sse_intrinsics = true;
-  intrinsics.avx_intrinsics = true;
-  return intrinsics;
-}
+/* Create filtered versions of the LLVM Pass Managers to filter out some
+of the expensive passes.
+Profiling:
+   learning/brain/google/xla/benchmarks:inception_cpu_benchmark
+   learning/brain/google/xla/benchmarks:cifarnet
+pointed to LICM and IndVarSimplify as the hottest passes.
+LICM is known to exhibit O(n^2) time in the number of instructions.
+IndVarSimplify is slow due to SCEV. If loops are emitted in canonical form,
+this pass is not necessary.
+Disabling these as a starting point.
+*/
+// TODO(b/64227304) Creating a custom pass pipeline will replace this.
 
-llvm::object::OwningBinary<llvm::object::ObjectFile> CompilerFunctor::
-operator()(llvm::Module& module) const {
-  llvm::legacy::PassManager module_passes;
-  llvm::legacy::FunctionPassManager function_passes(&module);
+namespace {
+class FilteredFunctionPassManager : public llvm::legacy::FunctionPassManager {
+ public:
+  FilteredFunctionPassManager(llvm::Module* m, bool disable_expensive_passes)
+      : llvm::legacy::FunctionPassManager(m),
+        disable_expensive_passes_(disable_expensive_passes) {}
+  void add(llvm::Pass* p) override {
+    llvm::legacy::FunctionPassManager::add(p);
+  }
+
+ private:
+  bool disable_expensive_passes_;
+};
+
+class FilteredPassManager : public llvm::legacy::PassManager {
+ public:
+  explicit FilteredPassManager(bool disable_expensive_passes)
+      : disable_expensive_passes_(disable_expensive_passes) {}
+  void add(llvm::Pass* p) override {
+    if (disable_expensive_passes_) {
+      llvm::StringRef PassName = p->getPassName();
+      if (PassName.contains("Unroll loops")) {
+        return;
+      }
+    }
+    llvm::legacy::PassManager::add(p);
+  }
+
+ private:
+  bool disable_expensive_passes_;
+};
+}  // anonymous namespace
+
+std::unique_ptr<llvm::MemoryBuffer> CompilerFunctor::operator()(
+    llvm::Module& module) const {
+  FilteredPassManager module_passes(disable_expensive_passes_);
+  FilteredFunctionPassManager function_passes(&module,
+                                              disable_expensive_passes_);
 
   VLOG(2) << "IR before optimizations";
   XLA_VLOG_LINES(2, llvm_ir::DumpModuleToString(module));
@@ -100,7 +137,7 @@ operator()(llvm::Module& module) const {
 
   CHECK(!llvm::verifyModule(module, &llvm::dbgs()));
 
-  runtime::RewriteIRRuntimeFunctions(&module);
+  runtime::RewriteIRRuntimeFunctions(&module, enable_fast_math_);
 
   // Buffer for holding machine code prior to constructing the ObjectFile.
   llvm::SmallVector<char, 0> stream_buffer;
@@ -120,86 +157,32 @@ operator()(llvm::Module& module) const {
   codegen_passes.run(module);
 
   // Construct ObjectFile from machine code buffer.
-  std::unique_ptr<llvm::MemoryBuffer> memory_buffer(
-      new llvm::ObjectMemoryBuffer(std::move(stream_buffer)));
-  llvm::Expected<std::unique_ptr<llvm::object::ObjectFile>>
-      object_file_or_error = llvm::object::ObjectFile::createObjectFile(
-          memory_buffer->getMemBufferRef());
-  CHECK(object_file_or_error);
-
-  std::unique_ptr<llvm::object::ObjectFile> object_file =
-      std::move(object_file_or_error.get());
-  if (VLOG_IS_ON(2)) {
-    StatusOr<DisassemblerResult> disassembly_status =
-        disassembler_->DisassembleObjectFile(*object_file);
-    if (disassembly_status.ok()) {
-      auto result = disassembly_status.ValueOrDie();
-      XLA_VLOG_LINES(2, result.text);
-      VLOG(2) << "compiled code size: " << result.code_size_bytes << " bytes";
-    }
-  }
-
-  return llvm::object::OwningBinary<llvm::object::ObjectFile>(
-      std::move(object_file), std::move(memory_buffer));
+  return std::unique_ptr<llvm::MemoryBuffer>(
+      new llvm::SmallVectorMemoryBuffer(std::move(stream_buffer)));
 }
 
-namespace {
-// Returns the set of vectorized library functions supported for the target.
-std::vector<llvm::VecDesc> VectorFunctionsForTargetLibraryInfoImpl(
-    llvm::Triple::ArchType arch, llvm::StringRef feature_string,
-    CompilerFunctor::VectorIntrinsics const& available_intrinsics) {
-  std::vector<llvm::VecDesc> vector_functions;
-
-  const llvm::VecDesc four_wide_vector_functions[] = {
-      {"expf", runtime::kExpV4F32SymbolName, 4},
-      {"llvm.exp.f32", runtime::kExpV4F32SymbolName, 4},
-
-      {"logf", runtime::kLogV4F32SymbolName, 4},
-      {"llvm.log.f32", runtime::kLogV4F32SymbolName, 4},
-  };
-
-  const llvm::VecDesc eight_wide_vector_functions[] = {
-      {"expf", runtime::kExpV8F32SymbolName, 8},
-      {"llvm.exp.f32", runtime::kExpV8F32SymbolName, 8},
-
-      {"logf", runtime::kLogV8F32SymbolName, 8},
-      {"llvm.log.f32", runtime::kLogV8F32SymbolName, 8},
-  };
-
-  // These functions are generated by XLA as LLVM IR, so they're always
-  // available.
-  const llvm::VecDesc ir_vector_functions[] = {
+static std::vector<llvm::VecDesc> VectorFunctionsForTargetLibraryInfoImpl() {
+  std::vector<llvm::VecDesc> result = {
       {"tanhf", runtime::kTanhV4F32SymbolName, 4},
       {"llvm.tanh.f32", runtime::kTanhV4F32SymbolName, 4},
 
       {"tanhf", runtime::kTanhV8F32SymbolName, 8},
       {"llvm.tanh.f32", runtime::kTanhV8F32SymbolName, 8},
+
+      {"expf", runtime::kExpV4F32SymbolName, 4},
+      {"llvm.exp.f32", runtime::kExpV4F32SymbolName, 4},
+
+      {"expf", runtime::kExpV8F32SymbolName, 8},
+      {"llvm.exp.f32", runtime::kExpV8F32SymbolName, 8},
+
+      {"logf", runtime::kLogV4F32SymbolName, 4},
+      {"llvm.log.f32", runtime::kLogV4F32SymbolName, 4},
+
+      {"logf", runtime::kLogV8F32SymbolName, 8},
+      {"llvm.log.f32", runtime::kLogV8F32SymbolName, 8},
   };
-
-  if (arch == llvm::Triple::x86 || llvm::Triple::x86_64) {
-    llvm::SmallVector<llvm::StringRef, 32> features;
-    feature_string.split(features, ',', -1, /*KeepEmpty=*/false);
-    if (std::find(features.begin(), features.end(), "+sse4.1") !=
-            features.end() &&
-        available_intrinsics.sse_intrinsics) {
-      vector_functions.insert(vector_functions.end(),
-                              std::begin(four_wide_vector_functions),
-                              std::end(four_wide_vector_functions));
-    }
-    if (std::find(features.begin(), features.end(), "+avx") != features.end() &&
-        available_intrinsics.avx_intrinsics) {
-      vector_functions.insert(vector_functions.end(),
-                              std::begin(eight_wide_vector_functions),
-                              std::end(eight_wide_vector_functions));
-    }
-  }
-
-  vector_functions.insert(vector_functions.end(),
-                          std::begin(ir_vector_functions),
-                          std::end(ir_vector_functions));
-  return vector_functions;
+  return result;
 }
-}  // namespace
 
 void CompilerFunctor::AddTargetInfoPasses(
     llvm::legacy::PassManagerBase* passes) const {
@@ -207,9 +190,7 @@ void CompilerFunctor::AddTargetInfoPasses(
   auto target_library_info_impl =
       MakeUnique<llvm::TargetLibraryInfoImpl>(target_triple);
   target_library_info_impl->addVectorizableFunctions(
-      VectorFunctionsForTargetLibraryInfoImpl(
-          target_triple.getArch(), target_machine_->getTargetFeatureString(),
-          available_intrinsics_));
+      VectorFunctionsForTargetLibraryInfoImpl());
   passes->add(
       new llvm::TargetLibraryInfoWrapperPass(*target_library_info_impl));
   passes->add(createTargetTransformInfoWrapperPass(

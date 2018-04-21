@@ -1,3 +1,18 @@
+/* Copyright 2017 The TensorFlow Authors. All Rights Reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+==============================================================================*/
+
 #ifdef TENSORFLOW_USE_GDR
 
 #include "tensorflow/contrib/gdr/gdr_memory_manager.h"
@@ -19,7 +34,6 @@
 #include "tensorflow/core/common_runtime/device.h"
 #include "tensorflow/core/common_runtime/dma_helper.h"
 #if GOOGLE_CUDA
-#include "cuda/include/cuda.h"
 #include "tensorflow/core/common_runtime/gpu/gpu_util.h"
 #include "tensorflow/core/common_runtime/gpu/process_state.h"
 #endif  // GOOGLE_CUDA
@@ -72,8 +86,9 @@ int TryToReadNumaNode(ibv_device* device) {
   if (strings::safe_strto32(content, &value)) {
     if (value < 0) {
       LOG(INFO) << "Successful NUMA node read from SysFS had negative value ("
-                << value << "), but there must be at least one NUMA node"
-                            ", so returning NUMA node zero";
+                << value
+                << "), but there must be at least one NUMA node"
+                   ", so returning NUMA node zero";
       return 0;
     }
     LOG(INFO) << "NUMA node for device: " << device->name << " is " << value;
@@ -111,13 +126,15 @@ class GdrMemoryManager : public RemoteMemoryManager {
 
   virtual void Stop() override;
 
-  virtual Status TransportOptionsFromTensor(
+  virtual void TransportOptionsFromTensor(
       ::google::protobuf::Any* mutable_transport_options, const Tensor& tensor,
-      Device* device, DeviceContext* device_context, bool on_host) override;
+      Device* device, DeviceContext* device_context, bool on_host,
+      StatusCallback done) override;
 
-  virtual Status TensorFromTransportOptions(
+  virtual void TensorFromTransportOptions(
       Tensor* tensor, const ::google::protobuf::Any& transport_options,
-      Device* device, DeviceContext* device_context, bool on_host) override;
+      Device* device, DeviceContext* device_context, bool on_host,
+      StatusCallback done) override;
 
  protected:
   Status CreateEndpoint(const string& host, const string& port,
@@ -130,10 +147,6 @@ class GdrMemoryManager : public RemoteMemoryManager {
   ibv_mr* FindMemoryRegion(void* addr, size_t length);
 
   void InsertMemoryRegion(void* addr, size_t length);
-
-#if GOOGLE_CUDA
-  void InsertCUDAMemoryRegion(void* addr, size_t length);
-#endif
 
   void EvictMemoryRegion(void* addr, size_t length);
 
@@ -278,8 +291,8 @@ Status GdrMemoryManager::Init() {
   // Host memory allocators
   for (Allocator* allocator : allocators) {
     auto* visitable_allocator = dynamic_cast<VisitableAllocator*>(allocator);
-    CHECK(visitable_allocator) << "is not visitable for instrumentation"
-                               << allocator->Name();
+    CHECK(visitable_allocator)
+        << "is not visitable for instrumentation" << allocator->Name();
     // Make sure we don't instrument the same allocator twice
     if (instrumented_.find(allocator) == std::end(instrumented_)) {
       visitable_allocator->AddAllocVisitor(alloc_visitor);
@@ -291,7 +304,7 @@ Status GdrMemoryManager::Init() {
 
 #if GOOGLE_CUDA
   VisitableAllocator::Visitor cuda_alloc_visitor =
-      std::bind(&GdrMemoryManager::InsertCUDAMemoryRegion, this, _1, _2);
+      std::bind(&GdrMemoryManager::InsertMemoryRegion, this, _1, _2);
   if (IsGDRAvailable()) {
     // Note we don't free allocated GPU memory so there is no free visitor
     int32_t bus_id = TryToReadNumaNode(listening_->verbs->device) + 1;
@@ -401,45 +414,74 @@ void GdrMemoryManager::Run() {
 
 void GdrMemoryManager::Stop() { stopped_ = true; }
 
-Status GdrMemoryManager::TransportOptionsFromTensor(
+void GdrMemoryManager::TransportOptionsFromTensor(
     ::google::protobuf::Any* mutable_transport_options, const Tensor& tensor,
-    Device* device, DeviceContext* device_context, bool on_host) {
+    Device* device, DeviceContext* device_context, bool on_host,
+    StatusCallback done) {
   auto buffer = DMAHelper::buffer(&tensor);
   void* addr = buffer->data();
   size_t length = buffer->size();
   if (length == 0) {
-    return errors::Unavailable("Cannot register tensor buffer of size 0");
+    done(errors::Unavailable("Cannot register tensor buffer of size 0"));
+    return;
   }
 
   ibv_mr* mr = FindMemoryRegion(addr, length);
 
-  Tensor host_copy;
 #if GOOGLE_CUDA
-  if (!on_host && mr != nullptr) {
-    TF_RETURN_IF_ERROR(GPUUtil::Sync(device));
-  } else if (!on_host) {
+  if (!on_host) {
     Allocator* alloc = ProcessState::singleton()->GetCUDAHostAllocator(0);
-    host_copy = Tensor(alloc, tensor.dtype(), tensor.shape());
-    Status s;
-    Notification n;
-    GPUUtil::CopyGPUTensorToCPU(device, device_context, &tensor, &host_copy,
-                                [&s, &n](const Status& status) {
-                                  s.Update(status);
-                                  n.Notify();
-                                });
-    n.WaitForNotification();
-    if (!s.ok()) {
-      return s;
-    }
-    buffer = DMAHelper::buffer(&host_copy);
-    addr = buffer->data();
-    length = buffer->size();
-    mr = FindMemoryRegion(addr, length);
+    Tensor* host_copy = new Tensor(alloc, tensor.dtype(), tensor.shape());
+    GPUUtil::CopyGPUTensorToCPU(
+        device, device_context, &tensor, host_copy,
+        [done, host_copy, mutable_transport_options, this](const Status& s) {
+          if (!s.ok()) {
+            done(s);
+            delete host_copy;
+            return;
+          }
+          auto buffer = DMAHelper::buffer(host_copy);
+          void* addr = buffer->data();
+          size_t length = buffer->size();
+          ibv_mr* mr = FindMemoryRegion(addr, length);
+
+          if (mr == nullptr) {
+            done(errors::Unavailable("Cannot find pinned memory region"));
+            delete host_copy;
+            return;
+          }
+
+          buffer->Ref();
+          TensorKey tensor_key = next_key_++;
+          {
+            mutex_lock l(server_mu_);
+            tensor_buffers_.insert(std::make_pair(tensor_key, buffer));
+          }
+
+          uint64_t checksum = 0;
+          if (VLOG_IS_ON(2)) {
+            checksum = GPUUtil::Checksum(*host_copy);
+          }
+
+          RemoteMemoryRegion remote_mr;
+          remote_mr.set_host(host_);
+          remote_mr.set_port(port_);
+          remote_mr.set_addr(reinterpret_cast<uint64_t>(addr));
+          remote_mr.set_rkey(mr->rkey);
+          remote_mr.set_tensor_key(tensor_key);
+          remote_mr.set_checksum(checksum);
+          mutable_transport_options->PackFrom(remote_mr);
+
+          done(Status::OK());
+          delete host_copy;
+        });
+    return;
   }
 #endif
 
   if (mr == nullptr) {
-    return errors::Unavailable("Cannot find pinned memory region");
+    done(errors::Unavailable("Cannot find pinned memory region"));
+    return;
   }
 
   buffer->Ref();
@@ -452,12 +494,8 @@ Status GdrMemoryManager::TransportOptionsFromTensor(
   uint64_t checksum = 0;
   if (VLOG_IS_ON(2)) {
 #ifdef GOOGLE_CUDA
-    if (device->tensorflow_gpu_device_info() && (!on_host)) {
-      if (host_copy.NumElements() > 0) {
-        checksum = GPUUtil::Checksum(device, device_context, host_copy);
-      } else {
-        checksum = GPUUtil::Checksum(device, device_context, tensor);
-      }
+    if (!on_host) {
+      checksum = GPUUtil::Checksum(device, device_context, tensor);
     } else {
       checksum = GPUUtil::Checksum(tensor);
     }
@@ -473,15 +511,17 @@ Status GdrMemoryManager::TransportOptionsFromTensor(
   remote_mr.set_checksum(checksum);
   mutable_transport_options->PackFrom(remote_mr);
 
-  return Status::OK();
+  done(Status::OK());
 }
 
-Status GdrMemoryManager::TensorFromTransportOptions(
+void GdrMemoryManager::TensorFromTransportOptions(
     Tensor* tensor, const ::google::protobuf::Any& transport_options,
-    Device* device, DeviceContext* device_context, bool on_host) {
+    Device* device, DeviceContext* device_context, bool on_host,
+    StatusCallback done) {
   RemoteMemoryRegion remote_mr;
   if (!transport_options.UnpackTo(&remote_mr)) {
-    return errors::NotFound("No RDMA transport options found");
+    done(errors::NotFound("No RDMA transport options found"));
+    return;
   }
 
   auto buffer = DMAHelper::buffer(tensor);
@@ -491,9 +531,7 @@ Status GdrMemoryManager::TensorFromTransportOptions(
 
   Tensor host_copy;
 #if GOOGLE_CUDA
-  if (!on_host && mr != nullptr) {
-    TF_RETURN_IF_ERROR(GPUUtil::Sync(device));
-  } else if (!on_host) {
+  if (mr == nullptr && !on_host) {
     Allocator* alloc = ProcessState::singleton()->GetCUDAHostAllocator(0);
     host_copy = Tensor(alloc, tensor->dtype(), tensor->shape());
     buffer = DMAHelper::buffer(&host_copy);
@@ -504,7 +542,8 @@ Status GdrMemoryManager::TensorFromTransportOptions(
 #endif  // GOOGLE_CUDA
 
   if (mr == nullptr) {
-    return errors::Unavailable("Cannot find pinned memory region");
+    done(errors::Unavailable("Cannot find pinned memory region"));
+    return;
   }
 
   decltype(clients_)::iterator iter;
@@ -515,8 +554,12 @@ Status GdrMemoryManager::TensorFromTransportOptions(
         std::make_pair(std::make_pair(remote_mr.host(), remote_mr.port()),
                        RdmaEndpointPtr(nullptr, EndpointDeleter)));
     if (success || iter->second.get() == nullptr) {
-      TF_RETURN_IF_ERROR(
-          CreateEndpoint(remote_mr.host(), remote_mr.port(), iter->second));
+      Status s =
+          CreateEndpoint(remote_mr.host(), remote_mr.port(), iter->second);
+      if (!s.ok()) {
+        done(s);
+        return;
+      }
     }
   }
   rdma_cm_id* id = iter->second.get();
@@ -525,37 +568,57 @@ Status GdrMemoryManager::TensorFromTransportOptions(
 
   if (rdma_post_read(id, nullptr, buffer->data(), buffer->size(), mr, 0,
                      remote_mr.addr(), remote_mr.rkey())) {
-    return errors::Unavailable(strerror(errno), ": ", "rdma_post_read failed");
+    done(errors::Unavailable(strerror(errno), ": ", "rdma_post_read failed"));
+    return;
   }
 
   ibv_send_wr wr = {};
   wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
   wr.imm_data = htonl(remote_mr.tensor_key());
-  wr.send_flags = IBV_SEND_FENCE | IBV_SEND_SIGNALED;
+  wr.send_flags = IBV_SEND_SIGNALED;
   ibv_send_wr* bad_wr;
   if (ibv_post_send(id->qp, &wr, &bad_wr)) {
-    return errors::Unavailable(strerror(errno), ": ", "ibv_post_send failed");
+    done(errors::Unavailable(strerror(errno), ": ", "ibv_post_send failed"));
+    return;
   }
 
   ibv_wc wc = {};
-  int ret = rdma_get_send_comp(id, &wc);
+  int ret;
+  while ((ret = ibv_poll_cq(id->send_cq, 1, &wc)) == 0)
+    ;
   if (ret < 0 || wc.status) {
-    return errors::Unavailable(ibv_wc_status_str(wc.status));
+    done(errors::Unavailable(ibv_wc_status_str(wc.status)));
+    return;
   }
 
 #if GOOGLE_CUDA
   if (host_copy.NumElements() > 0) {
-    Status s;
-    Notification n;
-    GPUUtil::CopyCPUTensorToGPU(&host_copy, device_context, device, tensor,
-                                [&s, &n](const Status& status) {
-                                  s.Update(status);
-                                  n.Notify();
-                                });
-    n.WaitForNotification();
-    if (!s.ok()) {
-      return s;
+    uint64_t checksum = 0;
+    if (VLOG_IS_ON(2)) {
+      checksum = GPUUtil::Checksum(host_copy);
+      CHECK(checksum == remote_mr.checksum())
+          << "Checksum mismatch: " << checksum << "!=" << remote_mr.checksum();
     }
+    Tensor* ref = new Tensor;
+    std::swap(host_copy, *ref);
+    GPUUtil::CopyCPUTensorToGPU(
+        ref, device_context, device, tensor,
+        [ref, done, buffer, remote_mr, start](const Status& s) {
+          if (!s.ok()) {
+            done(s);
+            delete ref;
+            return;
+          }
+          uint64_t end = Env::Default()->NowMicros();
+
+          VLOG(2) << "RDMA from remote memory region " << remote_mr.rkey()
+                  << " of size " << buffer->size() << " with tensor key "
+                  << remote_mr.tensor_key() << " took " << (end - start)
+                  << " micros";
+          done(Status::OK());
+          delete ref;
+        });
+    return;
   }
 #endif  // GOOGLE_CUDA
 
@@ -569,19 +632,15 @@ Status GdrMemoryManager::TensorFromTransportOptions(
   if (VLOG_IS_ON(2)) {
 #ifdef GOOGLE_CUDA
     if (device->tensorflow_gpu_device_info() && (!on_host)) {
-      if (host_copy.NumElements() > 0) {
-        checksum = GPUUtil::Checksum(device, device_context, host_copy);
-      } else {
-        checksum = GPUUtil::Checksum(device, device_context, *tensor);
-      }
+      checksum = GPUUtil::Checksum(device, device_context, *tensor);
     } else {
       checksum = GPUUtil::Checksum(*tensor);
     }
-    CHECK(checksum == remote_mr.checksum()) << "Checksum mismatch: " << checksum
-                                            << "!=" << remote_mr.checksum();
+    CHECK(checksum == remote_mr.checksum())
+        << "Checksum mismatch: " << checksum << "!=" << remote_mr.checksum();
 #endif
   }
-  return Status::OK();
+  done(Status::OK());
 }
 
 Status GdrMemoryManager::CreateEndpoint(const string& host, const string& port,
@@ -644,27 +703,6 @@ void GdrMemoryManager::InsertMemoryRegion(void* addr, size_t length) {
     LOG(WARNING) << "Cannot register memory region";
   }
 }
-
-#if GOOGLE_CUDA
-void GdrMemoryManager::InsertCUDAMemoryRegion(void* addr, size_t length) {
-  if (length == 0) return;
-  unsigned int flag = 1;
-  CUresult result =
-      cuPointerSetAttribute(&flag, CU_POINTER_ATTRIBUTE_SYNC_MEMOPS,
-                            reinterpret_cast<uintptr_t>(addr));
-  if (result != CUDA_SUCCESS) {
-    LOG(WARNING) << "Cannot register memory region to GPU";
-  }
-  ibv_mr* mr = rdma_reg_read(listening_.get(), addr, length);
-  if (mr != nullptr) {
-    mutex_lock l(alloc_mu_);
-    auto iter = std::upper_bound(mrs_.begin(), mrs_.end(), addr, &Comparator);
-    mrs_.insert(iter, {mr, &MRDeleter});
-  } else {
-    LOG(WARNING) << "Cannot register memory region to NIC";
-  }
-}
-#endif
 
 void GdrMemoryManager::EvictMemoryRegion(void* addr, size_t length) {
   if (length == 0) return;

@@ -29,6 +29,7 @@ limitations under the License.
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/kernels/ops_testutil.h"
 #include "tensorflow/core/lib/core/status_test_util.h"
+#include "tensorflow/core/lib/strings/str_util.h"
 #include "tensorflow/core/platform/test_benchmark.h"
 
 namespace tensorflow {
@@ -379,8 +380,8 @@ TEST_F(QuantizeAndDequantizeTest, Invalid_range_given) {
   AddInputFromArray<float>(TensorShape({}), {0.0});  // Max
 
   Status s = RunOpKernel();
-  EXPECT_TRUE(StringPiece(s.ToString())
-                  .contains("Invalid range: input_min 1 > input_max 0"))
+  EXPECT_TRUE(str_util::StrContains(s.ToString(),
+                                    "Invalid range: input_min 1 > input_max 0"))
       << s;
 }
 
@@ -401,20 +402,20 @@ TEST_F(QuantizeAndDequantizeTest, Invalid_range_given_V3) {
   AddInputFromArray<int32>(TensorShape({}), {8});    // num_bits
 
   Status s = RunOpKernel();
-  EXPECT_TRUE(StringPiece(s.ToString())
-                  .contains("Invalid range: input_min 1 > input_max 0"))
+  EXPECT_TRUE(str_util::StrContains(s.ToString(),
+                                    "Invalid range: input_min 1 > input_max 0"))
       << s;
 }
 
-#define BM_SIMPLE_QUAN_DEQUAN(DEVICE)                           \
-  static void BM_SIMPLE_QUAN_DEQUAN_##DEVICE(int iters) {       \
-    auto root = Scope::NewRootScope().ExitOnError();            \
-    ops::QuantizeAndDequantizeV2(root, {-3.5}, {-3.5}, {-3.5}); \
-    TF_CHECK_OK(root.status());                                 \
-    Graph* g = new Graph(OpRegistry::Global());                 \
-    TF_CHECK_OK(root.ToGraph(g));                               \
-    test::Benchmark(#DEVICE, g).Run(iters);                     \
-  }                                                             \
+#define BM_SIMPLE_QUAN_DEQUAN(DEVICE)                     \
+  static void BM_SIMPLE_QUAN_DEQUAN_##DEVICE(int iters) { \
+    auto root = Scope::NewRootScope().ExitOnError();      \
+    ops::QuantizeAndDequantizeV2(root, -3.5, -3.5, -3.5); \
+    TF_CHECK_OK(root.status());                           \
+    Graph* g = new Graph(OpRegistry::Global());           \
+    TF_CHECK_OK(root.ToGraph(g));                         \
+    test::Benchmark(#DEVICE, g).Run(iters);               \
+  }                                                       \
   BENCHMARK(BM_SIMPLE_QUAN_DEQUAN_##DEVICE);
 
 BM_SIMPLE_QUAN_DEQUAN(cpu);

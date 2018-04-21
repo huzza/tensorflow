@@ -259,8 +259,11 @@ TEST_F(HeapSimulatorTest, MultiplyDot) {
       HloInstruction::CreateParameter(2, f32scalar_, "paramY"));
   auto mul = builder.AddInstruction(HloInstruction::CreateBinary(
       f32vec4_, HloOpcode::kMultiply, paramA, paramX));
+  DotDimensionNumbers dot_dnums;
+  dot_dnums.add_lhs_contracting_dimensions(1);
+  dot_dnums.add_rhs_contracting_dimensions(0);
   auto dot = builder.AddInstruction(
-      HloInstruction::CreateBinary(f32vec4_, HloOpcode::kDot, mul, paramY));
+      HloInstruction::CreateDot(f32vec4_, mul, paramY, dot_dnums));
 
   // The buffer for dot is the output, and it cannot be shared with the buffer
   // for mul, since dot isn't elementwise.
@@ -292,8 +295,11 @@ TEST_F(HeapSimulatorTest, MultiplyDotAdd) {
       HloInstruction::CreateParameter(2, f32scalar_, "paramY"));
   auto mul = builder.AddInstruction(HloInstruction::CreateBinary(
       f32vec4_, HloOpcode::kMultiply, paramA, paramX));
+  DotDimensionNumbers dot_dnums;
+  dot_dnums.add_lhs_contracting_dimensions(1);
+  dot_dnums.add_rhs_contracting_dimensions(0);
   auto dot = builder.AddInstruction(
-      HloInstruction::CreateBinary(f32vec4_, HloOpcode::kDot, mul, paramY));
+      HloInstruction::CreateDot(f32vec4_, mul, paramY, dot_dnums));
   auto add = builder.AddInstruction(
       HloInstruction::CreateBinary(f32vec4_, HloOpcode::kAdd, dot, paramA));
 
@@ -327,10 +333,13 @@ TEST_F(HeapSimulatorTest, MultiplyDotDot) {
       HloInstruction::CreateParameter(2, f32scalar_, "paramY"));
   auto mul = builder.AddInstruction(HloInstruction::CreateBinary(
       f32vec4_, HloOpcode::kMultiply, paramA, paramX));
+  DotDimensionNumbers dot_dnums;
+  dot_dnums.add_lhs_contracting_dimensions(1);
+  dot_dnums.add_rhs_contracting_dimensions(0);
   auto dot0 = builder.AddInstruction(
-      HloInstruction::CreateBinary(f32vec4_, HloOpcode::kDot, mul, paramY));
+      HloInstruction::CreateDot(f32vec4_, mul, paramY, dot_dnums));
   auto dot1 = builder.AddInstruction(
-      HloInstruction::CreateBinary(f32vec4_, HloOpcode::kDot, dot0, paramY));
+      HloInstruction::CreateDot(f32vec4_, dot0, paramY, dot_dnums));
 
   // The buffer for dot1 is the output.  No buffers can be shared.  The buffer
   // for mul is freed before the end, since it's no longer used after dot0
@@ -365,10 +374,13 @@ TEST_F(HeapSimulatorTest, MultiplyDotDotTuple) {
       HloInstruction::CreateParameter(2, f32scalar_, "paramY"));
   auto mul = builder.AddInstruction(HloInstruction::CreateBinary(
       f32vec4_, HloOpcode::kMultiply, paramA, paramX));
+  DotDimensionNumbers dot_dnums;
+  dot_dnums.add_lhs_contracting_dimensions(1);
+  dot_dnums.add_rhs_contracting_dimensions(0);
   auto dot0 = builder.AddInstruction(
-      HloInstruction::CreateBinary(f32vec4_, HloOpcode::kDot, mul, paramY));
+      HloInstruction::CreateDot(f32vec4_, mul, paramY, dot_dnums));
   auto dot1 = builder.AddInstruction(
-      HloInstruction::CreateBinary(f32vec4_, HloOpcode::kDot, dot0, paramY));
+      HloInstruction::CreateDot(f32vec4_, dot0, paramY, dot_dnums));
   auto tuple =
       builder.AddInstruction(HloInstruction::CreateTuple({dot0, dot1}));
 
@@ -394,6 +406,56 @@ TEST_F(HeapSimulatorTest, MultiplyDotDotTuple) {
       {kFree, tracker.BufferAt(dot0, {})},
       {kFree, tracker.BufferAt(dot1, {})},
       {kFree, tracker.BufferAt(tuple, {})},
+      {kFinish, nullptr},
+  });
+}
+
+TEST_F(HeapSimulatorTest, IndependentTupleElements) {
+  auto builder = HloComputation::Builder(TestName());
+  auto paramA = builder.AddInstruction(
+      HloInstruction::CreateParameter(0, f32scalar_, "paramA"));
+  auto paramB = builder.AddInstruction(
+      HloInstruction::CreateParameter(1, f32scalar_, "paramB"));
+  auto mul = builder.AddInstruction(HloInstruction::CreateBinary(
+      f32scalar_, HloOpcode::kMultiply, paramA, paramB));
+  auto add = builder.AddInstruction(HloInstruction::CreateBinary(
+      f32scalar_, HloOpcode::kAdd, paramA, paramB));
+  auto tuple = builder.AddInstruction(HloInstruction::CreateTuple({mul, add}));
+  auto element0 = builder.AddInstruction(
+      HloInstruction::CreateGetTupleElement(f32scalar_, tuple, 0));
+  auto broadcast = builder.AddInstruction(
+      HloInstruction::CreateBroadcast(f32vec4_, element0, {0}));
+  auto sub = builder.AddInstruction(HloInstruction::CreateBinary(
+      f32scalar_, HloOpcode::kSubtract, paramA, paramB));
+  auto element1 = builder.AddInstruction(
+      HloInstruction::CreateGetTupleElement(f32scalar_, tuple, 1));
+  auto output = builder.AddInstruction(
+      HloInstruction::CreateTuple({broadcast, sub, element1}));
+
+  HeapSimulatorTracker tracker(TestName(), builder.Build(),
+                               {paramA, paramB, mul, add, tuple, element0,
+                                broadcast, sub, element1, output});
+  tracker.ExpectCallSequence({
+      {kAlloc, tracker.BufferAt(paramA, {})},
+      {kAlloc, tracker.BufferAt(paramB, {})},
+      {kAlloc, tracker.BufferAt(mul, {})},
+      {kAlloc, tracker.BufferAt(add, {})},
+      {kAlloc, tracker.BufferAt(tuple, {})},
+      {kAlloc, tracker.BufferAt(broadcast, {})},
+      // The mul can be freed right after the broadcast happens, even though
+      // The other GetTupleElement is still alive.
+      {kFree, tracker.BufferAt(mul, {})},
+      {kAlloc, tracker.BufferAt(sub, {})},
+      // The temporary tuple is now dead.
+      {kFree, tracker.BufferAt(tuple, {})},
+      {kAlloc, tracker.BufferAt(output, {})},
+      // All params and outputs are freed at the end.
+      {kFree, tracker.BufferAt(paramA, {})},
+      {kFree, tracker.BufferAt(paramB, {})},
+      {kFree, tracker.BufferAt(add, {})},
+      {kFree, tracker.BufferAt(broadcast, {})},
+      {kFree, tracker.BufferAt(sub, {})},
+      {kFree, tracker.BufferAt(output, {})},
       {kFinish, nullptr},
   });
 }
@@ -481,7 +543,7 @@ TEST_F(HeapSimulatorTest, WholeModule) {
 // Base class for heap algorithm tests.
 class HeapAlgorithmTestBase : public ::testing::Test {
  protected:
-  HeapAlgorithmTestBase() {
+  HeapAlgorithmTestBase() : builder_("heap_simulator_test") {
     buffer_a_ = DummyLogicalBuffer();
     buffer_b_ = DummyLogicalBuffer();
     buffer_c_ = DummyLogicalBuffer();
@@ -505,15 +567,16 @@ class HeapAlgorithmTestBase : public ::testing::Test {
   const LogicalBuffer* buffer_i_;
 
  private:
-  // Create a dummy LogicalBuffer to pass to the heap algorithm.  Since the
-  // algorithms only use the buffer as a handle, we don't need to fill in much
-  // other than the id and color.
+  // Create a dummy LogicalBuffer to pass to the heap algorithm.
   const LogicalBuffer* DummyLogicalBuffer() {
     const LogicalBuffer::Id id = buffers_.size();
-    buffers_.emplace_back(MakeUnique<LogicalBuffer>(nullptr, ShapeIndex{}, id));
+    auto const0 = builder_.AddInstruction(
+        HloInstruction::CreateConstant(Literal::CreateR0<float>(1.0)));
+    buffers_.emplace_back(MakeUnique<LogicalBuffer>(const0, ShapeIndex{}, id));
     return buffers_.back().get();
   }
 
+  HloComputation::Builder builder_;
   std::vector<std::unique_ptr<LogicalBuffer>> buffers_;
 };
 

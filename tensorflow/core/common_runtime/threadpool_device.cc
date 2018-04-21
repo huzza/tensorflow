@@ -16,6 +16,8 @@ limitations under the License.
 #include "tensorflow/core/common_runtime/threadpool_device.h"
 
 #include "tensorflow/core/common_runtime/local_device.h"
+#include "tensorflow/core/common_runtime/scoped_allocator.h"
+#include "tensorflow/core/common_runtime/scoped_allocator_mgr.h"
 #include "tensorflow/core/framework/allocator.h"
 #include "tensorflow/core/framework/allocator_registry.h"
 #include "tensorflow/core/framework/device_base.h"
@@ -40,7 +42,8 @@ ThreadPoolDevice::ThreadPoolDevice(const SessionOptions& options,
                                    Allocator* allocator)
     : LocalDevice(options, Device::BuildDeviceAttributes(
                                name, DEVICE_CPU, memory_limit, locality)),
-      allocator_(allocator) {}
+      allocator_(allocator),
+      scoped_allocator_mgr_(new ScopedAllocatorMgr(name)) {}
 
 ThreadPoolDevice::~ThreadPoolDevice() {}
 
@@ -48,7 +51,8 @@ void ThreadPoolDevice::Compute(OpKernel* op_kernel, OpKernelContext* context) {
   // When TraceMe profiling is off (which is the default), the
   // following TraceMe constructor is simply a conditional test of
   // false value. Measurements show that its overhead is negligible.
-  port::Tracing::TraceMe trace_me(op_kernel->name(), op_kernel->type_string());
+  port::Tracing::TraceMe trace_me(op_kernel->name(), op_kernel->type_string(),
+                                  op_kernel->IsExpensive());
   if (port::Tracing::IsActive()) {
     // TODO(pbar) We really need a useful identifier of the graph node.
     const uint64 id = Hash64(op_kernel->name());
@@ -64,13 +68,24 @@ Allocator* ThreadPoolDevice::GetAllocator(AllocatorAttributes attr) {
   return allocator_;
 }
 
+Allocator* ThreadPoolDevice::GetScopedAllocator(AllocatorAttributes attr,
+                                                int64 step_id) {
+  if (attr.scope_id > 0) {
+    return scoped_allocator_mgr_->GetContainer(step_id)->GetInstance(
+        attr.scope_id);
+  }
+  LOG(FATAL) << "Unexpected call to ThreadPoolDevice::GetScopedAllocator "
+             << "attr.scope_id = " << attr.scope_id;
+  return allocator_;
+}
+
 Status ThreadPoolDevice::MakeTensorFromProto(
     const TensorProto& tensor_proto, const AllocatorAttributes alloc_attrs,
     Tensor* tensor) {
   if (tensor_proto.dtype() > 0 && tensor_proto.dtype() <= DataType_MAX) {
     Tensor parsed(tensor_proto.dtype());
     if (parsed.FromProto(cpu_allocator(), tensor_proto)) {
-      *tensor = parsed;
+      *tensor = std::move(parsed);
       return Status::OK();
     }
   }

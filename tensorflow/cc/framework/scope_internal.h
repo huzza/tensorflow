@@ -13,8 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#ifndef THIRD_PARTY_TENSORFLOW_CC_FRAMEWORK_SCOPE_INTERNAL_H_
-#define THIRD_PARTY_TENSORFLOW_CC_FRAMEWORK_SCOPE_INTERNAL_H_
+#ifndef TENSORFLOW_CC_FRAMEWORK_SCOPE_INTERNAL_H_
+#define TENSORFLOW_CC_FRAMEWORK_SCOPE_INTERNAL_H_
 
 #include "tensorflow/cc/framework/scope.h"
 
@@ -43,6 +43,9 @@ class Scope::Impl {
        const std::shared_ptr<NameMap>& name_map,
        const std::shared_ptr<ShapeRefiner>& refiner);
 
+  const string& name() const { return name_; }
+  const std::vector<Operation>& control_deps() const { return control_deps_; }
+
  private:
   friend class Scope;
 
@@ -58,7 +61,8 @@ class Scope::Impl {
     enum class Colocate;
   };
 
-  Impl(Graph* graph, Status* status, NameMap* name_map, ShapeRefiner* refiner);
+  Impl(Graph* graph, Status* status, NameMap* name_map, ShapeRefiner* refiner,
+       bool disable_shape_inference);
   Impl(const Scope& other, Tags::ScopeName, const string& name,
        bool copy_names);
   Impl(const Scope& other, Tags::OpName, const string& name,
@@ -97,14 +101,20 @@ class Scope::Impl {
 
   const std::vector<Operation> control_deps_;
 
+  // The fully-qualified name of this scope (i.e. includes any parent scope
+  // names).
   const string name_ = "";
   const string op_name_ = "";
   const bool exit_on_error_ = false;
   const string kernel_label_ = "";
   const string device_ = "";
   const std::unordered_set<string> colocation_constraints_;
+
+  // If true, Scope::DoShapeInference() always returns Status:OK().
+  // TODO(skyewm): remove this when possible
+  const bool disable_shape_inference_;
 };
 
 }  // namespace tensorflow
 
-#endif  // THIRD_PARTY_TENSORFLOW_CC_FRAMEWORK_SCOPE_INTERNAL_H_
+#endif  // TENSORFLOW_CC_FRAMEWORK_SCOPE_INTERNAL_H_
